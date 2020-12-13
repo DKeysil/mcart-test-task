@@ -1,6 +1,9 @@
 from aiohttp import web, ClientSession
 from xml.dom import minidom
 import json
+from aiohttp_cors import setup as cors_setup, ResourceOptions
+from loguru import logger
+from datetime import datetime
 
 routes = web.RouteTableDef()
 currency_lst = minidom.parse('currency_list.asp')
@@ -49,7 +52,7 @@ async def get_currency_list(request: web.Request):
     :param request:
     :return: Список валют, который содержит все доступные валюты в формате [('RUB', 'Рубль'), ..]
     """
-
+    logger.info(request)
     return web.json_response(currency_lst, dumps=custom_json_dumps, status=200)
 
 
@@ -74,19 +77,28 @@ async def get_exchange_rate_difference(request: web.Request):
     """
     Возвращает разницу курса относительно рубля между двумя датами за выбранную дату
     GET параметры: символьный код продукта, дата 1, дата 2
-    Например: api/exchange_rate_difference?symb=BYN&date_req1=12/07/2020&date_req2=15/07/2020
+    Например: api/exchange_rate_difference?symb=BYN&date_req1=2020-07-12&date_req2=2020-07-15
     :param request:
     :return: Курс за первую дату, курс за вторую дату и разницу между ними
     """
+    logger.info(request)
     args = request.query
+    logger.info(args)
     try:
         title = currency_dct.get(args.get("symb"))[0]
         currency_id = currency_dct.get(args.get("symb"))[1]
     except TypeError:
         return web.json_response({'error': 'Exchange rate not found'}, status=404)
+    try:
+        date_req1 = args.get("date_req1")
+        date_req1 = datetime.strptime(date_req1, '%Y-%m-%d').strftime('%d/%m/%Y')
+        date_req2 = args.get("date_req2")
+        date_req2 = datetime.strptime(date_req2, '%Y-%m-%d').strftime('%d/%m/%Y')
+    except ValueError:
+        return web.json_response({'error': 'Error in parameters'}, status=422)
     exchange_api_link = 'http://www.cbr.ru/scripts/XML_dynamic.asp?' \
-                        f'date_req1={args.get("date_req1")}&' \
-                        f'date_req2={args.get("date_req2")}&' \
+                        f'date_req1={date_req1}&' \
+                        f'date_req2={date_req2}&' \
                         f'VAL_NM_RQ={currency_id}'
 
     async with ClientSession() as session:
@@ -118,5 +130,17 @@ async def get_exchange_rate_difference(request: web.Request):
 
 app = web.Application()
 app.add_routes(routes)
+
+cors = cors_setup(
+    app,
+    defaults={
+        "*": ResourceOptions(
+            allow_credentials=True, expose_headers="*", allow_headers="*",
+        )
+    },
+)
+
+for route in list(app.router.routes()):
+    cors.add(route)
 
 web.run_app(app)
