@@ -4,6 +4,8 @@ import json
 from aiohttp_cors import setup as cors_setup, ResourceOptions
 from loguru import logger
 from datetime import datetime
+import aioredis
+
 
 routes = web.RouteTableDef()
 currency_lst = minidom.parse('currency_list.asp')
@@ -56,7 +58,7 @@ async def get_currency_list(request: web.Request):
     return web.json_response(currency_lst, dumps=custom_json_dumps, status=200)
 
 
-def currency_processing(doc: minidom.Document) -> (float, float, float):
+def currency_processing(doc: minidom.Document) -> (str, str):
     """
     Обрабатывает полученные данные
     :param doc:
@@ -64,12 +66,10 @@ def currency_processing(doc: minidom.Document) -> (float, float, float):
     """
     first = doc.firstChild.firstChild.getElementsByTagName('Value')[0].firstChild.data
     last = doc.lastChild.lastChild.getElementsByTagName('Value')[0].firstChild.data
-    first = float(first.replace(',', '.'))
-    last = float(last.replace(',', '.'))
     # Деньги надо обрабатывать в минимальной единице (копейки), а не переводить во float, но я этого тут не делал,
     # так как сайт ЦБ предоставляет и так округленные данные
 
-    return first, last, (last - first)
+    return first, last
 
 
 @routes.get('/api/exchange_rate_difference')
@@ -101,46 +101,66 @@ async def get_exchange_rate_difference(request: web.Request):
                         f'date_req2={date_req2}&' \
                         f'VAL_NM_RQ={currency_id}'
 
-    async with ClientSession() as session:
-        async with session.get(exchange_api_link) as resp:
-            # Get exchange rates
-            result = await resp.text()
+    redis: aioredis.Redis = request.app['redis_pool']
+    first, last = None, None
 
-    doc = minidom.parseString(result)
-    try:
-        val_curs = doc.firstChild.firstChild.data
-        if val_curs == "Error in parameters":
+    if exchange_dict := await redis.hgetall(currency_id, encoding='utf-8'):
+        first = exchange_dict.get(date_req1)
+        last = exchange_dict.get(date_req2)
+    if first is None or last is None:
+        async with ClientSession() as session:
+            async with session.get(exchange_api_link) as resp:
+                # Get exchange rates
+                result = await resp.text()
+
+        doc = minidom.parseString(result)
+        try:
+            val_curs = doc.firstChild.firstChild.data
+            if val_curs == "Error in parameters":
+                return web.json_response({'error': 'Error in parameters'}, status=422)
+        except AttributeError:
+            pass
+
+        try:
+            first, last = currency_processing(doc)
+        except AttributeError:
             return web.json_response({'error': 'Error in parameters'}, status=422)
-    except AttributeError:
-        pass
+        await redis.hset(currency_id, date_req1, first)
+        await redis.hset(currency_id, date_req2, last)
 
-    try:
-        first, last, difference = currency_processing(doc)
-        jsn = {
-            'title': title,
-            'first_exchange_rate': first,
-            'second_exchange_rate': last,
-            'difference': difference
-        }
-    except AttributeError:
-        return web.json_response({'error': 'Error in parameters'}, status=422)
+    first = float(first.replace(',', '.'))
+    last = float(last.replace(',', '.'))
+
+    jsn = {
+        'title': title,
+        'first_exchange_rate': first,
+        'second_exchange_rate': last,
+        'difference': last - first
+    }
 
     return web.json_response(jsn, dumps=custom_json_dumps, status=200)
 
 
-app = web.Application()
-app.add_routes(routes)
+async def init():
+    app = web.Application()
+    app.add_routes(routes)
 
-cors = cors_setup(
-    app,
-    defaults={
-        "*": ResourceOptions(
-            allow_credentials=True, expose_headers="*", allow_headers="*",
-        )
-    },
-)
+    cors = cors_setup(
+        app,
+        defaults={
+            "*": ResourceOptions(
+                allow_credentials=True, expose_headers="*", allow_headers="*",
+            )
+        },
+    )
 
-for route in list(app.router.routes()):
-    cors.add(route)
+    for route in list(app.router.routes()):
+        cors.add(route)
 
-web.run_app(app)
+    redis_pool = await aioredis.create_redis_pool('redis://localhost')
+    app['redis_pool'] = redis_pool
+
+    return app
+
+
+web.run_app(init())
